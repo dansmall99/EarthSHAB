@@ -152,6 +152,7 @@ class GFS:
 
         lat_i = self.getNearestLat(lat,self.LAT_LOW,self.LAT_HIGH)
         lon_i = self.getNearestLon(lon,self.LON_LOW,self.LON_HIGH)
+        print(str(int(hour_index)),str(lat_i),str(lon_i))
         i = self.closest(self.hgtprs[int(hour_index),:,lat_i,lon_i], alt)
         return i
 
@@ -202,7 +203,7 @@ class GFS:
 
         diff = coord["timestamp"] - self.gfs_time
         hour_index = (diff.days*24 + diff.seconds / 3600.)/3
-
+        print("hour_index = " + str(hour_index), str(diff.days),str(diff.seconds))
         lat_i = self.getNearestLat(coord["lat"],self.LAT_LOW,self.LAT_HIGH)
         lon_i = self.getNearestLon(coord["lon"],self.LON_LOW,self.LON_HIGH)
         z_low = self.getNearestAlt(hour_index,coord["lat"],coord["lon"],coord["alt"]) #fix this for lower and Upper
