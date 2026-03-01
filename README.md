@@ -22,6 +22,11 @@ Setup Environment:
 pip install -e .
 ```
 
+Flask front end Environment:
+```
+from main directory: 'flask run', will launch a server on port 5000.  Access via https://localhost:5000 also compatible with pythonanywhere.com
+```
+
 ## Examples
 
 ``config_earth.py`` includes adjustable parameters and default parameters for running any of the files discussed below. These parameters include balloon size, envelope material properties, deployment location, date and time, etc.
@@ -35,6 +40,25 @@ These examples can all be run with the included GFS and ERA forecasts as well as
 <img src = "img/rainbow_trajectories_altitude.png" />
 
 <img src = "img/rainbow_trajectories_map.PNG" />
+
+## V1.2
+This code has been refactored to: 
+1) produce a KML file in addition to the other sim outputs 
+2) with app.py, run a flask website with a partial front end of EarthSHAB config_earth exposed, as well as a way to display the simulated data in cesium on the page. 
+3) refactored the code to use the new NOAA regime for NOMADS:    
+NOAA retired their OpenDAP/DODS endpoint (nomads.ncep.noaa.gov/dods/…) which used to serve GFS data directly as NetCDF over HTTP.    
+The replacement is the GRIB Filter which serves the same data but in GRIB2 format        
+    — requires a conversion step that didn't exist before.    
+    What the new saveNETCDF.py does      
+        Reads the same config_earth.py keys — lat, lon, lat_range, lon_range, download_days, filename — so no config changes are needed.      
+        Builds GRIB-filter URLs that request the 4 variables EarthSHAB needs (UGRD, VGRD, TMP, HGT) on all isobaric pressure levels from 75–1000 mb, clipped to your bounding box. 
+        Downloads one GRIB2 file per 3-hour forecast step with the 12-second delay NOAA requires between requests (they will block you otherwise).      
+        Opens each GRIB2 with cfgrib (which wraps the C eccodes library) → xarray Dataset.      
+        Concatenates all timesteps and renames variables to EarthSHAB's expected names (ugrd, vgrd, tmp, hgt, lev).      
+        Writes a compressed NetCDF4 file to forecasts/<filename> 
+           — same location and structure GFS.py already reads. 
+4) with runall.bash and autoNETCDF.py, set up a bash shell to re-simulate every 6 hours when new data is available
+There have been additional fixes for variable weather download center, better error reporting.
 
 
 ## Author
