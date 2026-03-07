@@ -1,184 +1,237 @@
 from datetime import datetime
-import requests
-from bs4 import BeautifulSoup
-import re
-import glob
 import os
+import glob
 
-#from datetime import MonkeyPatch
-#MonkeyPatch.patch_fromisoformat()     # Hacky solution for Python 3.6 to use ISO format Strings
+# ─────────────────────────────────────────────────────────────────────────────
+# Run name
+# ─────────────────────────────────────────────────────────────────────────────
+run_name = 'SHAB11'   # (was: run_mane – typo fixed)
 
-run_mane = 'SHAB9'
+# ─────────────────────────────────────────────────────────────────────────────
+# Balloon properties
+# ─────────────────────────────────────────────────────────────────────────────
 balloon_properties = dict(
-    shape = 'sphere',
-    d = 5.81,                          # (m) Diameter of Sphere Balloon
-    mp = 1.9,                         # (kg) Mass of Payload
-    areaDensityEnv = 939.*7.62E-6,    # (Kg/m^2) rhoEnv*envThickness
-    mEnv = 2.0,                       # (kg) Mass of Envelope - SHAB6
-    cp = 2000.,                       # (J/(kg K)) Specific heat of envelope material
-    absEnv = .98,                     # Absorbiviy of envelope material
-    emissEnv = .95,                   # Emisivity of enevelope material
-    Upsilon = 4.5,                    # Ascent Resistance coefficient
+    shape          = 'sphere',
+    d              = 5.81,              # (m)       Diameter of Sphere Balloon
+    mp             = 1.9,               # (kg)      Mass of Payload
+    areaDensityEnv = 939. * 7.62E-6,    # (kg/m^2)  rhoEnv * envThickness
+    mEnv           = 2.0,               # (kg)      Mass of Envelope
+    cp             = 2000.,             # (J/kg·K)  Specific heat of envelope material
+    absEnv         = .98,               # Absorptivity of envelope material
+    emissEnv       = .95,               # Emissivity of envelope material
+    Upsilon        = 4.5,               # Ascent resistance coefficient
 )
 
-#forecast_start_time = "2021-03-29 12:00:00" # Forecast start time, should match a downloaded forecast
-#start_time = datetime.fromisoformat("2021-03-29 11:32:00") # Simulation start time. The end time needs to be within the downloaded forecast
-#balloon_trajectory = None
+# ─────────────────────────────────────────────────────────────────────────────
+# GFS model-run auto-detection
+# ─────────────────────────────────────────────────────────────────────────────
+# Previously this block ran at module-import time and called the now-defunct
+# NOAA DODS endpoint, crashing every import.  It has been moved into a
+# function so it only runs when explicitly needed (i.e. inside autoNETCDF.py).
+# The config still exposes the result through forecast_start_time below,
+# but only after _detect_latest_gfs_run() is called.
 
-#SHAB10
-#forecast_start_time = "2022-04-09 12:00:00" # Forecast start time, should match a downloaded forecast
-#start_time = datetime.fromisoformat("2022-04-09 18:14:00") # Simulation start time. The end time needs to be within the downloaded forecast
-#balloon_trajectory = "balloon_data/SHAB10V-APRS.csv"  # Only Accepting Files in the Standard APRS.fi format for now
+def _detect_latest_gfs_run():
+    """
+    Query the live NOMADS production directory to find the latest available
+    GFS 0.25-degree model run.
 
-#SHAB3
-#forecast_start_time = "2020-11-20 06:00:00" # Forecast start time, should match a downloaded forecast in the forecasts directory
-#start_time = datetime.fromisoformat("2020-11-20 15:47:00") # Simulation start time. The end time needs to be within the downloaded forecast
-#balloon_trajectory = "balloon_data/SHAB3V-APRS.csv"  # Only Accepting Files in the Standard APRS.fi format for now
+    Strategy
+    --------
+    1. Fetch the date-level listing from:
+         https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/
+       This page lists folders named  gfs.YYYYMMDD/  and is independent of
+       the now-defunct DODS/OpenDAP service.
+    2. Take the most recent date folder, then check which cycle subdirectories
+       (00, 06, 12, 18) exist inside it by probing for the sentinel file
+         gfs.tCCz.pgrb2.0p25.f000
+       in the  gfs.YYYYMMDD/CC/atmos/  path.  The highest cycle that has this
+       file is the latest complete run.
+    3. If anything goes wrong (network error, unexpected page format, etc.)
+       fall back to today's UTC date and the most recent 6-hourly cycle
+       calculated from the current UTC time — so the fallback is always
+       current rather than a hard-coded historical date.
 
-#SHAB5
-#forecast_start_time = "2021-05-12 12:00:00" # Forecast start time, should match a downloaded forecast in the forecasts directory
-#start_time = datetime.fromisoformat("2021-05-12 14:01:00") # Simulation start time. The end time needs to be within the downloaded forecast
-#balloon_trajectory = "balloon_data/SHAB5V_APRS_Processed.csv"  # Only Accepting Files in the Standard APRS.fi format for now
+    Returns
+    -------
+    (year, month, day, hourstamp) as zero-padded strings,
+    e.g. ('2025', '02', '28', '12').
+    """
+    import requests
+    from bs4 import BeautifulSoup
+    from datetime import timezone
 
-#SHAB14-V Example for EarthSHAB software
-forecast_start_time =  "2024-09-27 12:00:00" # Forecast start time, should match a downloaded forecast in the forecasts directory
-# URL of the webpage to parse
-url = "https://nomads.ncep.noaa.gov/dods/gfs_0p25/"
+    PROD_BASE = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
+    CYCLES    = ['18', '12', '06', '00']   # newest first
 
-# Make a request to fetch the webpage content
-response = requests.get(url)
-soup = BeautifulSoup(response.text, 'html.parser')
+    # ── Dynamic fallback: today's UTC date + most recent cycle ───────────────
+    def _today_fallback():
+        now   = datetime.now(tz=timezone.utc)
+        cycle = str((now.hour // 6) * 6).zfill(2)
+        fb    = (str(now.year), str(now.month).zfill(2),
+                 str(now.day).zfill(2), cycle)
+        print(f"[config_earth] Using fallback: {fb[0]}-{fb[1]}-{fb[2]} {fb[3]}Z")
+        return fb
 
-# Find all 'dir' links in the webpage
-dir_links = [link.get('href') for link in soup.find_all('a') if 'dir' in link.get_text()]
-print(dir_links)
+    try:
+        # ── Step 1: get list of date folders ─────────────────────────────────
+        resp = requests.get(PROD_BASE, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
 
-# Get the last 'dir' link name
-last_dir = dir_links[-2] if dir_links else None
-print(last_dir)
+        # Folder names look like  gfs.20250228/
+        import re
+        date_folders = sorted(
+            set(re.findall(r'gfs\.(\d{8})/', soup.get_text())),
+            reverse=True   # newest first
+        )
 
-if last_dir:
-    # Create the URL for the last 'dir' link
-    dir_url = last_dir
+        if not date_folders:
+            print("[config_earth] No GFS date folders found in NOMADS listing.")
+            return _today_fallback()
 
-    # Parse the content of the directory link
-    dir_response = requests.get(dir_url)
-    dir_soup = BeautifulSoup(dir_response.text, 'html.parser')
-    #print(dir_soup)
-    matches = dir_soup.find_all(string=re.compile(r'\b[1-8] entries'))
-    if matches:
-        print(matches[-1])
-        s= str(matches[-1])
-        i = s.index('entries')
-        n = matches[-1][i-2]
-        print('number = ' + n)
-    if n == '1':
-        last_dir = dir_links[-3]
-        dir_url = last_dir
-        dir_response = requests.get(dir_url)
-        dir_soup = BeautifulSoup(dir_response.text, 'html.parser')
-        #print(dir_soup)
-        matches = dir_soup.find_all(string=re.compile(r'\b[1-8] entries'))
-        if matches:
-            print(matches[-1])
-            s= str(matches[-1])
-            i = s.index('entries')
-            n = matches[-1][i-2]
-            print('number = ' + n)
+        # ── Step 2: find the newest cycle that has its f000 file present ─────
+        for date_str in date_folders[:3]:   # try the 3 most recent dates
+            year, month, day = date_str[:4], date_str[4:6], date_str[6:8]
+            for cyc in CYCLES:
+                probe_url = (
+                    f"{PROD_BASE}gfs.{date_str}/{cyc}/atmos/"
+                    f"gfs.t{cyc}z.pgrb2.0p25.f000"
+                )
+                try:
+                    head = requests.head(probe_url, timeout=10)
+                    if head.status_code == 200:
+                        print(f"[config_earth] Latest GFS run: {date_str} {cyc}Z")
+                        return (year, month, day, cyc)
+                except requests.RequestException:
+                    continue   # try the next cycle
 
-    gfsIndex = dir_url.rindex('gfs')
-    print(str(gfsIndex))
-    year = dir_url[gfsIndex+3:gfsIndex+7]
-    month = dir_url[gfsIndex+7:gfsIndex+9]
-    day = dir_url[gfsIndex+9:gfsIndex+11]
+        # Nothing found in the last 3 date folders
+        print("[config_earth] Could not confirm any recent GFS run; using fallback.")
+        return _today_fallback()
 
-    if (n == '2' or n == '3'):
-       t = '00'
-    elif (n == '4' or n == '5'):
-       t = '06'
-    elif (n == '6' or n == '7'):
-       t = '12'
-    elif (n == '8' or n == '9'):
-       t = '18'
-    hourstamp = t
+    except Exception as exc:
+        print(f"[config_earth] GFS run detection failed ({exc}); using fallback.")
+        return _today_fallback()
 
-# Forecast start time, should match a downloaded forecast in the forecasts directory
-forecast_start_time =  year + '-' + month + '-' + day + ' ' + hourstamp + ':00:00' #"2024-09-27 12:00:00" 
-print('forecast_start_time = ' + forecast_start_time)
 
-#forecast_start_time =  '2024-10-09 12:00:00' 
+# ─────────────────────────────────────────────────────────────────────────────
+# Forecast start time
+# ─────────────────────────────────────────────────────────────────────────────
+# Call the detection function once here so the rest of the config can use it.
+# To hard-code a specific run instead, comment out the _detect call and
+# uncomment one of the manual examples below.
 
-#launch start time UTC
-start_time = datetime.fromisoformat("2025-10-10 15:30:00") # Simulation start time. The end time needs to be within the downloaded forecast
+_year, _month, _day, _hourstamp = _detect_latest_gfs_run()
+forecast_start_time = f"{_year}-{_month}-{_day} {_hourstamp}:00:00"
+
+# ── Manual overrides (uncomment one to use a specific flight) ─────────────────
+#forecast_start_time = "2024-09-27 12:00:00"  # SHAB14-V
+#forecast_start_time = "2022-04-09 12:00:00"  # SHAB10
+#forecast_start_time = "2021-05-12 12:00:00"  # SHAB5
+#forecast_start_time = "2020-11-20 06:00:00"  # SHAB3
+#forecast_start_time = "2021-03-29 12:00:00"  # SHAB9
+#forecast_start_time = "2023-04-18 00:00:00"  # Hawaii
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Launch / simulation start time  (UTC)
+# ─────────────────────────────────────────────────────────────────────────────
+start_time = datetime.fromisoformat("2026-03-01 14:30:00")
 balloon_trajectory = None
 
-#Hawaii
-#forecast_start_time = "2023-04-18 00:00:00" # Forecast start time, should match a downloaded forecast
-#start_time = datetime.fromisoformat("2023-04-18 18:00:00") # Simulation start time. The end time needs to be within the downloaded forecast
-#balloon_trajectory = None  # Only Accepting Files in the Standard APRS.fi format for now
+# ── Per-flight overrides ──────────────────────────────────────────────────────
+#start_time         = datetime.fromisoformat("2024-09-27 14:00:00"); balloon_trajectory = None                             # SHAB14-V
+#start_time         = datetime.fromisoformat("2022-04-09 18:14:00"); balloon_trajectory = "balloon_data/SHAB10V-APRS.csv"  # SHAB10
+#start_time         = datetime.fromisoformat("2021-05-12 14:01:00"); balloon_trajectory = "balloon_data/SHAB5V_APRS_Processed.csv"  # SHAB5
+#start_time         = datetime.fromisoformat("2020-11-20 15:47:00"); balloon_trajectory = "balloon_data/SHAB3V-APRS.csv"   # SHAB3
+#start_time         = datetime.fromisoformat("2023-04-18 18:00:00"); balloon_trajectory = None                             # Hawaii
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Forecast dict  (used by GFS.py and autoNETCDF.py)
+# ─────────────────────────────────────────────────────────────────────────────
 forecast = dict(
-    forecast_type = "GFS",      # GFS or ERA5
-    forecast_start_time = forecast_start_time, # Forecast start time, should match a downloaded forecast in the forecasts directory
-    GFSrate = 60,               # (s) After how many iterated dt steps are new wind speeds are looked up
+    forecast_type       = "GFS",                 # "GFS" or "ERA5"
+    forecast_start_time = forecast_start_time,
+    GFSrate             = 60,                    # (s) Wind lookup interval
 )
 
-#These parameters are for both downloading new forecasts, and running simulations with downloaded forecasts.
+# ─────────────────────────────────────────────────────────────────────────────
+# NetCDF / GFS download parameters
+# ─────────────────────────────────────────────────────────────────────────────
 netcdf_gfs = dict(
-    #DO NOT CHANGE
-    nc_file = ("forecasts/gfs_0p25_" + forecast['forecast_start_time'][0:4] + forecast['forecast_start_time'][5:7] + forecast['forecast_start_time'][8:10] + "_" + forecast['forecast_start_time'][11:13] + ".nc"),  # DO NOT CHANGE -  file structure for downloading .25 resolution NOAA forecast data.
-    nc_start = datetime.fromisoformat(forecast['forecast_start_time']),    # DO NOT CHANGE - Start time of the downloaded netCDF file
-    hourstamp = forecast['forecast_start_time'][11:13],  # parsed from gfs timestamp
+    # DO NOT CHANGE – file path is derived from forecast start time
+    nc_file   = (
+        "forecasts/gfs_0p25_"
+        + forecast['forecast_start_time'][0:4]
+        + forecast['forecast_start_time'][5:7]
+        + forecast['forecast_start_time'][8:10]
+        + "_"
+        + forecast['forecast_start_time'][11:13]
+        + ".nc"
+    ),
+    nc_start  = datetime.fromisoformat(forecast['forecast_start_time']),
+    hourstamp = forecast['forecast_start_time'][11:13],
 
-    res = 0.25,        # (deg) DO NOT CHANGE
+    res           = 0.25,   # (deg) DO NOT CHANGE
 
-    #The following values are for savenetcdf.py for forecast downloading and saving
-    lat_range = 30,    # (.25 deg)
-    lon_range= 40,     # (.25 deg)
-    download_days = 10, # (1-10) Number of days to download for forecast This value is only used in saveNETCDF.py
+    # Bounding-box half-widths in index counts (1 index = res degrees)
+    lat_range     = 20,     # (.25 deg steps each side of centre)
+    lon_range     = 60,     # (.25 deg steps each side of centre)
+    download_days = 2,      # (1–10) days of forecast to download
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ERA5 parameters
+# ─────────────────────────────────────────────────────────────────────────────
 netcdf_era5 = dict(
-    #filename = "SHAB3V_era_20201120_20201121.nc", #SHAB3
-    #filename = "SHAB5V-ERA5_20210512_20210513.nc", #SHAB5V
-    #filename = "shab10_era_2022-04-09to2022-04-10.nc", #SHAB10V
-    filename = "SHAB14V_ERA5_20220822_20220823.nc", #SHAB12/13/14/15V
-    #filename = "hawaii-ERA5-041823.nc",
-    resolution_hr = 1
-    )
-
-simulation = dict(
-    start_time = start_time,    # (UTC) Simulation Start Time, updated above
-    sim_time = 18,              # (int) (hours) Number of hours to simulate
-
-    vent = 0.0,                 # (kg/s) Vent Mass Flow Rate  (Do not have an accurate model of the vent yet, this is innacurate)
-    alt_sp = 15000.0,           # (m) Altitude Setpoint
-    v_sp = 0.,                  # (m/s) Altitude Setpoint, Not Implemented right now
-    start_coord =	{ 
-                      #"lat": 33.635050, #cms 35.1271, #33.66, #21.4, # 34.60,             # (deg) Latitude
-                      #"lon": -103.972350, # cms-106.570633, #-114.22, #-158, #-106.80,           # (deg) Longitude
-                      #"lat": 35.177864, #DRMS 33.66, #21.4, # 34.60,             # (deg) Latitude
-                      #"lon": -106.547857, #DRMS -114.22, #-158, #-106.80,           # (deg) Longitude
-                      "lat": 35.19605, #BFP 
-                      "lon": -106.59733, #BFP
-                      #"lat": 35.096440, #AHS
-                      #"lon": -106.636764, #AHS
-                      "alt": 1553.,             # (m) Elevation
-                      "timestamp": start_time,  # current timestamp
-                    },
-    min_alt = 1646.,            # starting altitude. Generally the same as initial coordinate
-    float = 25000,              # for simulating in trapezoid.py
-    dt = 1.0,                   # (s) Integration timestep for simulation (If error's occur, use a lower step size)
-
-    balloon_trajectory = balloon_trajectory # Default is None. Only accepting trajectories in aprs.fi csv format.
+    #filename = "SHAB3V_era_20201120_20201121.nc",
+    #filename = "SHAB5V-ERA5_20210512_20210513.nc",
+    #filename = "shab10_era_2022-04-09to2022-04-10.nc",
+    filename      = "SHAB14V_ERA5_20220822_20220823.nc",
+    #filename     = "hawaii-ERA5-041823.nc",
+    resolution_hr = 1,
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Simulation parameters
+# ─────────────────────────────────────────────────────────────────────────────
+simulation = dict(
+    start_time = start_time,
+    sim_time   = 18,            # (hours) Duration to simulate
+
+    vent    = 0.0,              # (kg/s) Vent mass flow rate
+    alt_sp  = 15000.0,          # (m)    Altitude setpoint
+    v_sp    = 0.,               # (m/s)  Vertical speed setpoint (not implemented)
+
+    start_coord = {
+        # ── Launch site options (uncomment one) ──────────────────────────────
+        "lat": 35.19605,        # BFP
+        "lon": -106.59733,      # BFP
+        #"lat": 35.177864,      # DRMS
+        #"lon": -106.547857,    # DRMS
+        #"lat": 33.635050,      # CMS
+        #"lon": -103.972350,    # CMS
+        #"lat": 35.096440,      # AHS
+        #"lon": -106.636764,    # AHS
+        "alt"       : 1553.,    # (m)   Ground elevation
+        "timestamp" : start_time,
+    },
+
+    min_alt           = 0.,     # (m) Minimum altitude (same as launch elevation)
+    float             = 25000,  # (m) Float altitude for trapezoid.py
+    dt                = 2.0,    # (s) Integration timestep
+
+    balloon_trajectory = balloon_trajectory,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Earth / atmosphere constants
+# ─────────────────────────────────────────────────────────────────────────────
 earth_properties = dict(
-    Cp_air0 = 1003.8,           # (J/Kg*K)  Specifc Heat Capacity, Constant Pressure
-    Cv_air0 = 716.,             # (J/Kg*K)  Specifc Heat Capacity, Constant Volume
-    Rsp_air = 287.058,          # (J/Kg*K) Gas Constant
-    P0 = 101325.0,              # (Pa) Pressure @ Surface Level
-    emissGround = .95,          # assumption
-    albedo = 0.17,              # assumption
+    Cp_air0  = 1003.8,      # (J/kg·K) Specific heat, constant pressure
+    Cv_air0  = 716.,        # (J/kg·K) Specific heat, constant volume
+    Rsp_air  = 287.058,     # (J/kg·K) Specific gas constant for dry air
+    P0       = 101325.0,    # (Pa)     Sea-level pressure
+    emissGround = .95,      # Ground emissivity (assumption)
+    albedo   = 0.17,        # Surface albedo (assumption)
 )

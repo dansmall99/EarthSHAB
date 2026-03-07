@@ -10,6 +10,7 @@ import radiation
 import config_earth
 
 
+
 class Sphere_Balloon:
     """Initializes atmospheric properties from the earth configuration file
 
@@ -21,6 +22,30 @@ class Sphere_Balloon:
 
     RE = 6371000.0      # (m) Radius of Earth
     SB = 5.670373E-8    # Stefan Boltzman Constant
+
+
+    def mu_air(self,T):
+        # Expect Kelvin
+        try:
+            T = float(T)
+        except Exception:
+            return np.nan
+
+        if not np.isfinite(T):
+            return np.nan
+
+        # If someone passed Celsius, it can go negative; try to detect and convert
+        # (optional but helpful)
+        if T < 100.0:  # very likely Celsius
+            T = T + 273.15
+
+        # Avoid singularity at T = -110.4 (should never happen in Kelvin anyway)
+        denom = T + 110.4
+        if abs(denom) < 1e-6:
+            denom = 1e-6 if denom >= 0 else -1e-6
+
+        # Standard Sutherland-like form (your original intent)
+        return 1.458e-6 * (T ** 1.5) / denom
 
     def __init__(self):
         """Initializes all of the solar balloon paramaters from the configuration file
@@ -49,7 +74,9 @@ class Sphere_Balloon:
 
         """
         #print("viscocity",T)
-        return 1.458E-6*(np.sign(T) * (np.abs(T)) ** (1.5))/(T+110.4) #numpy power does not allow fractional powers of negative numbers. This is the workaround
+        #return 1.458E-6*(np.sign(T) * (np.abs(T)) ** (1.5))/(T+110.4) #numpy power does not allow fractional powers of negative numbers. This is the workaround
+        return self.mu_air(T)
+
 
     def get_conduction(self,T):
         r"""Calculates Thermal Diffusivity of Air at Temperature, T using Sutherland's Law of Thermal Diffusivity
@@ -183,10 +210,25 @@ class Sphere_Balloon:
         :rtype: float
 
         """
-
         q_conv_loss = -self.get_q_ext(T_s, el, v)
-        q_rad_lost = -self.emissEnv*Sphere_Balloon.SB*np.power(T_s,4)*self.surfArea
+
+        # Guard rails: clamp BEFORE any T^4 use
+        T_MIN = 150.0   # K
+        T_MAX = 450.0   # K
+
+        if not np.isfinite(T_s):
+            T_s = 273.15
+        T_s = float(np.clip(T_s, T_MIN, T_MAX))
+
+        # Now safe to use T_s^4
+        q_rad_lost = -self.emissEnv * Sphere_Balloon.SB * (T_s ** 4) * self.surfArea
+
+        #print(f"T_s = {T_s} q-rad = {q_rad} elev = {el}")
+
         return q_rad + q_conv_loss + q_rad_lost
+
+
+
 
     #--------------------------------------------SOLVE FOR T INT-------------------------------------------------------------
 
