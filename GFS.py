@@ -13,13 +13,10 @@ from geographiclib.geodesic import Geodesic
 import datetime
 from datetime import timedelta
 import sys
+from backports.datetime_fromisoformat import MonkeyPatch
+MonkeyPatch.patch_fromisoformat()   #Hacky solution for Python 3.6 to use ISO format Strings
 
 import config_earth
-
-class OutOfBoundsError(Exception):
-    """Raised when the balloon trajectory leaves the downloaded forecast bounds."""
-    pass
-
 
 class GFS:
     def __init__(self, centered_coord):
@@ -31,40 +28,15 @@ class GFS:
         #self.hours3 = config_earth.netcdf_gfs['hours3']
 
         self.file = netCDF4.Dataset(config_earth.netcdf_gfs["nc_file"])  # Only accepting manual uploads for now
-        # Derive gfs_time from actual file time[0], never from stale config nc_start
-        import netCDF4 as _nc4_inner
-        from datetime import datetime as _dt, timedelta as _td
-        _time_var = self.file.variables['time']
-        if hasattr(_time_var, 'units'):
-            _tc = list(_nc4_inner.num2date(_time_var[:], units=_time_var.units))
-            _t0 = _tc[0]
-            self.gfs_time = _dt(_t0.year, _t0.month, _t0.day, _t0.hour, getattr(_t0,'minute',0), getattr(_t0,'second',0))
-        else:
-            _t0 = _time_var[0]
-            self.gfs_time = _dt(1970,1,1) + _td(seconds=int(_t0))
-        print(f"[GFS] time[0] raw={_time_var[0]}  units='{getattr(_time_var,'units','(none)') }'"  )
+        self.gfs_time = config_earth.netcdf_gfs['nc_start']
         self.res = config_earth.netcdf_gfs['res']
 
         self.geod = Geodesic.WGS84
 
-        # Decode time — cfgrib/xarray typically writes time as seconds since
-        # 1970-01-01. Print the raw value and units attr for diagnostics.
         time_arr = self.file.variables['time']
-        raw_t0 = int(time_arr[0])
-        units_attr = getattr(time_arr, 'units', 'NO UNITS ATTR')
-        print(f"[GFS] time[0] raw={raw_t0}  units='{units_attr}'")
 
-        if hasattr(time_arr, 'units'):
-            # Units attribute present — let netCDF4 decode it properly
-            self.time_convert = list(netCDF4.num2date(
-                time_arr[:], units=time_arr.units, only_use_cftime_datetimes=False
-            ))
-        else:
-            # No units attr — cfgrib wrote raw seconds since 1970-01-01 UTC
-            self.time_convert = [
-                datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=int(t))
-                for t in time_arr[:]
-            ]
+        #Manually add time units, not imported with units formatted in saveNETCDF.py
+        self.time_convert = netCDF4.num2date(time_arr[:], units="days since 0001-01-01", has_year_zero=True)
 
 
         #Determine Index values from netcdf4 subset
@@ -90,12 +62,6 @@ class GFS:
         self.vgdrps0 = self.file.variables['vgrdprs'][self.start_time_idx:self.end_time_idx+1,:,self.lat_min_idx:self.lat_max_idx,self.lon_min_idx:self.lon_max_idx]
         self.hgtprs  = self.file.variables['hgtprs'][self.start_time_idx:self.end_time_idx+1,:,self.lat_min_idx:self.lat_max_idx,self.lon_min_idx:self.lon_max_idx]
 
-        # All data now loaded into numpy arrays — close the file handle so
-        # the .nc file is not held open during the simulation. This prevents
-        # "Device or resource busy" errors when clearing the forecasts directory.
-        self.file.close()
-        self.file = None
-
         #print("Data downloaded.\n\n")
         print()
 
@@ -110,12 +76,10 @@ class GFS:
         print()
 
         if not desired_simulation_end_time <= self.time_convert[self.end_time_idx]:
-            max_hours = int(diff_time // 3600)
-            raise RuntimeError(
-                f"Simulation duration ({self.sim_time}h) exceeds forecast coverage ({max_hours}h). "
-                f"Forecast ends at {self.time_convert[self.end_time_idx]}. "
-                f"Either reduce sim_time to {max_hours}h or download a longer forecast."
-            )
+            print(colored("Desired simulation run time of " + str(self.sim_time)  +
+            " hours is out of bounds of downloaded forecast. " +
+            "Check simulation start time and/or download a new forecast.", "red"))
+            sys.exit()
 
 
     def determineRanges(self,netcdf_ranges):
@@ -134,15 +98,26 @@ class GFS:
 
         print(colored("Forecast Information (Parsed from netcdf file):", "blue", attrs=['bold']))
 
-        # cfgrib-written files contain only the downloaded bounding box region
-        # with no fill values — the entire array is valid data.
-        t_size, lat_size, lon_size = netcdf_ranges.shape
-        self.start_time_idx = 0
-        self.end_time_idx   = t_size   - 1
-        self.lat_min_idx    = 0
-        self.lat_max_idx    = lat_size - 1
-        self.lon_min_idx    = 0
-        self.lon_max_idx    = lon_size - 1
+        results = np.all(~netcdf_ranges.mask)
+        #Results will almost always be false,  unless an entire netcdf of the world is downloaded. Or if the netcdf is downloaded via another method with lat/lon bounds
+        if results == False:
+            timerange, latrange, lonrange = np.nonzero(~netcdf_ranges.mask)
+
+            self.start_time_idx = timerange.min()
+            self.end_time_idx = timerange.max()
+            self.lat_min_idx = latrange.min() #Min/Max are switched compared to with ERA5
+            self.lat_max_idx = latrange.max()
+            self.lon_min_idx = lonrange.min()
+            self.lon_max_idx = lonrange.max()
+        else: #This might be broken for time
+            #Need to double check this for an entire world netcdf download
+            t_size, lat_size, lon_size = netcdf_ranges.shape
+            self.start_time_idx = 0
+            self.end_time_idx   = t_size   - 1
+            self.lat_min_idx    = 0
+            self.lat_max_idx    = lat_size - 1
+            self.lon_min_idx    = 0
+            self.lon_max_idx    = lon_size - 1
 
     def closest(self, arr, k):
         """ Given an ordered array and a value, determines the index of the closest item contained in the array.
@@ -175,7 +150,6 @@ class GFS:
 
         lat_i = self.getNearestLat(lat,self.LAT_LOW,self.LAT_HIGH)
         lon_i = self.getNearestLon(lon,self.LON_LOW,self.LON_HIGH)
-        print(str(int(hour_index)),str(lat_i),str(lon_i))
         i = self.closest(self.hgtprs[int(hour_index),:,lat_i,lon_i], alt)
         return i
 
@@ -192,12 +166,6 @@ class GFS:
         else:
             h_idx0 = h_nearest - 1
             h_idx1 = h_nearest
-
-        # Clamp to valid array bounds — prevents IndexError at ground level
-        # or above the top pressure level (e.g. after sunset descent to alt=0)
-        max_idx = len(h) - 1
-        h_idx0 = max(0, min(h_idx0, max_idx))
-        h_idx1 = max(0, min(h_idx1, max_idx))
 
         return h_idx0, h_idx1
 
@@ -232,9 +200,7 @@ class GFS:
 
         diff = coord["timestamp"] - self.gfs_time
         hour_index = (diff.days*24 + diff.seconds / 3600.)/3
-        max_hour_idx = self.ugdrps0.shape[0] - 2  # -2 so int(hour_index)+1 is always valid
-        hour_index = min(hour_index, max_hour_idx)
-        print("hour_index = " + str(hour_index), str(diff.days),str(diff.seconds))
+
         lat_i = self.getNearestLat(coord["lat"],self.LAT_LOW,self.LAT_HIGH)
         lon_i = self.getNearestLon(coord["lon"],self.LON_LOW,self.LON_HIGH)
         z_low = self.getNearestAlt(hour_index,coord["lat"],coord["lon"],coord["alt"]) #fix this for lower and Upper
@@ -268,8 +234,6 @@ class GFS:
 
         diff = coord["timestamp"] - self.gfs_time
         hour_index = (diff.days*24 + diff.seconds / 3600.)/3
-        max_hour_idx = self.ugdrps0.shape[0] - 2  # -2 so int(hour_index)+1 is always valid
-        hour_index = min(hour_index, max_hour_idx)
 
         lat_i = self.getNearestLat(coord["lat"],self.LAT_LOW,self.LAT_HIGH)
         lon_i = self.getNearestLon(coord["lon"],self.LON_LOW,self.LON_HIGH)
@@ -340,11 +304,12 @@ class GFS:
 
         h_idx0, h_idx1 = self.get2NearestAltIdxs(h, alt_m)
 
-        # Clamp indices as a second safety layer — get2NearestAltIdxs already
-        # clamps, but guard here too in case h and u/v arrays differ in length
-        max_idx = len(u) - 1
-        h_idx0 = max(0, min(h_idx0, max_idx))
-        h_idx1 = max(0, min(h_idx1, max_idx))
+        #Check to make sure altitude isn't outside bounds of altitude array for interpolating
+        if h_idx0 == -1:
+            h_idx0 = 0
+
+        if h_idx1 == 0: #this one should most likely never trigger because altitude forecasts go so high.
+            h_idx1 = -1
 
         bearing0, speed0 = self.windVectorToBearing(u[h_idx0], v[h_idx0])
         bearing1, speed1 = self.windVectorToBearing(u[h_idx1], v[h_idx1])
@@ -421,12 +386,6 @@ class GFS:
         #x_wind_vel,y_wind_vel = self.wind_alt_Interpolate(coord)
         #x_wind_vel_old, y_wind_vel_old = None, None
 
-        # Skip wind interpolation entirely if already landed — avoids index errors
-        # from pressure level lookups at alt=0
-        if coord["alt"] <= self.min_alt:
-            return [coord['lat'], coord['lon'], 0.0, 0.0, 0.0, 0.0, 0.0,
-                    self.lat[i], self.lon[j], self.hgtprs[0, z, i, j]]
-
         x_wind_vel,y_wind_vel, x_wind_vel_old, y_wind_vel_old = self.wind_alt_Interpolate2(coord)
 
         bearing = math.degrees(math.atan2(y_wind_vel,x_wind_vel))
@@ -434,23 +393,14 @@ class GFS:
         d = math.pow((math.pow(y_wind_vel,2)+math.pow(x_wind_vel,2)),.5) * dt #dt multiplier
         g = self.geod.Direct(coord["lat"], coord["lon"], bearing, d)
 
-        new_lat = g['lat2']
-        new_lon = g['lon2']
-        if new_lat < self.LAT_LOW or new_lat > self.LAT_HIGH or (new_lon % 360) < self.LON_LOW or (new_lon % 360) > self.LON_HIGH:
-            margin_lat = round(abs(float(self.LAT_HIGH) - float(self.LAT_LOW)) / 2, 1)
-            margin_lon = round(abs(float(self.LON_HIGH) - float(self.LON_LOW)) / 2, 1)
-            suggested_lat = int(round(margin_lat + 5, 0))
-            suggested_lon = int(round(margin_lon + 10, 0))
-            raise OutOfBoundsError(
-                f"Balloon exited forecast bounds at lat={new_lat:.4f} lon={new_lon:.4f}\n"
-                f"  Downloaded bounds: lat [{self.LAT_LOW:.2f}, {self.LAT_HIGH:.2f}]  "
-                f"lon [{self.LON_LOW:.2f}, {self.LON_HIGH:.2f}]\n"
-                f"  Suggestion: increase lat_range to {suggested_lat} and "
-                f"lon_range to {suggested_lon} in config or GUI"
-            )
+        if g['lat2'] < self.LAT_LOW or g['lat2']  > self.LAT_HIGH or (g['lon2'] % 360) < self.LON_LOW or (g['lon2'] % 360) > self.LON_HIGH:
+            print(colored("WARNING: Trajectory is out of bounds of downloaded netcdf forecast", "yellow"))
 
         if coord["alt"] <= self.min_alt:
-            # Balloon has landed — return current position, skip wind interpolation result
-            return [coord['lat'],coord['lon'],x_wind_vel,y_wind_vel, x_wind_vel_old, y_wind_vel_old, bearing, self.lat[i], self.lon[j], self.hgtprs[0,z,i,j]]
+            # Balloon should remain stationary if it's reached the minimum altitude
+            return [coord['lat'],coord['lon'],x_wind_vel,y_wind_vel, x_wind_vel_old, y_wind_vel_old, bearing, self.lat[i], self.lon[j], self.hgtprs[0,z,i,j]] # hgtprs doesn't matter here so is set to 0
         else:
-            return [new_lat, new_lon, x_wind_vel, y_wind_vel, x_wind_vel_old, y_wind_vel_old, bearing, self.lat[i], self.lon[j], self.hgtprs[0,z,i,j]]
+            return [g['lat2'],g['lon2'],x_wind_vel,y_wind_vel, x_wind_vel_old, y_wind_vel_old, bearing, self.lat[i], self.lon[j], self.hgtprs[0,z,i,j]]
+
+        if g['lat2'] < self.LAT_LOW or g['lat2'] > self.LAT_HIGH or g['lon2'] < self.LON_LOW or g['lon2'] > self.LON_HIGH:
+            print(colored("WARNING: Trajectory is out of bounds of downloaded netcdf forecast", "yellow"))
