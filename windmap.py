@@ -20,19 +20,16 @@ import sys
 
 import GFS
 import ERA5
-import netCDF4
 
 class Windmap:
     def __init__(self):
 
         if config_earth.forecast['forecast_type'] == "GFS":
             self.gfs = GFS.GFS(config_earth.simulation['start_coord'])
-            # GFS closes its file handle after loading data into numpy arrays,
-            # so we must open the file independently here.
-            self.file = netCDF4.Dataset(config_earth.netcdf_gfs["nc_file"])
+            self.file = self.gfs.file
         else:
             self.era5 = ERA5.ERA5(config_earth.simulation['start_coord'])
-            self.file = netCDF4.Dataset(config_earth.netcdf_gfs["nc_file"])
+            self.file = self.era5.file
 
 
         #FIX THE DEFINING OF THESE Variables

@@ -8,4 +8,4 @@ __pycache__
 *.pyo
 *.pyd
 *.egg
-*.egg-infosecret_keys.txt
+*.egg-info
